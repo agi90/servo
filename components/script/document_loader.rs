@@ -7,10 +7,12 @@
 
 use dom::bindings::js::JS;
 use dom::document::Document;
+use ipc_channel::ipc::IpcSender;
 use msg::constellation_msg::PipelineId;
+use net_traits::request::PotentialCORSRequestInit;
 use net_traits::{PendingAsyncLoad, LoadContext};
 use net_traits::{RequestSource, AsyncResponseTarget};
-use net_traits::{ResourceThreads, IpcSend};
+use net_traits::{FetchResponseMsg, ResourceThreads, IpcSend};
 use std::thread;
 use url::Url;
 
@@ -147,6 +149,16 @@ impl DocumentLoader {
                       referrer: &Document) {
         let pending = self.prepare_async_load(load, referrer);
         pending.load_async(listener)
+    }
+
+    /// Initiate a new fetch.
+    pub fn fetch_async(&mut self,
+                       load: LoadType,
+                       request: PotentialCORSRequestInit,
+                       fetch_target: IpcSender<FetchResponseMsg>,
+                       referrer: &Document) {
+        let pending = self.prepare_async_load(load, referrer);
+        pending.fetch_async(request, fetch_target);
     }
 
     /// Mark an in-progress network request complete.
