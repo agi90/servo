@@ -39,7 +39,7 @@ use hyper::method::Method;
 use hyper::mime::{Attr, Mime};
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use msg::constellation_msg::{PipelineId, ReferrerPolicy};
-use request::{Request, RequestInit};
+use request::{PotentialCORSRequestInit, Request, RequestInit};
 use response::{HttpsState, Response};
 use std::io::Error as IOError;
 use std::thread;
@@ -422,6 +422,7 @@ pub enum CoreResourceMsg {
     /// Request the data associated with a particular URL
     Load(LoadData, LoadConsumer, Option<IpcSender<ResourceId>>),
     Fetch(RequestInit, IpcSender<FetchResponseMsg>),
+    PotentialCORSFetch(PotentialCORSRequestInit, IpcSender<FetchResponseMsg>),
     /// Try to make a websocket connection to a URL.
     WebsocketConnect(WebSocketCommunicate, WebSocketConnectData),
     /// Store a set of cookies for a given originating URL
@@ -518,6 +519,13 @@ impl PendingAsyncLoad {
                                       &self);
         let consumer = LoadConsumer::Listener(listener);
         self.core_resource_thread.send(CoreResourceMsg::Load(load_data, consumer, None)).unwrap();
+    }
+
+    /// Initiate the fetch associated with this pending load.
+    pub fn fetch_async(mut self, request: PotentialCORSRequestInit, fetch_target: IpcSender<FetchResponseMsg>) {
+        self.guard.neuter();
+
+        self.core_resource_thread.send(CoreResourceMsg::PotentialCORSFetch(request, fetch_target)).unwrap();
     }
 }
 

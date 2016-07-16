@@ -26,11 +26,14 @@ use dom::window::ScriptHelpers;
 use encoding::label::encoding_from_whatwg_label;
 use encoding::types::{DecoderTrap, EncodingRef};
 use html5ever::tree_builder::NextParserState;
+use hyper::header::Headers;
 use hyper::http::RawStatus;
+use hyper::method::Method;
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
 use js::jsval::UndefinedValue;
-use net_traits::{AsyncResponseListener, AsyncResponseTarget, Metadata, NetworkError};
+use net_traits::request::{CORSSettings, Destination, ParserMetadata, PotentialCORSRequestInit, Type as RequestType};
+use net_traits::{FetchResponseListener, Metadata, NetworkError};
 use network_listener::{NetworkListener, PreInvoke};
 use std::ascii::AsciiExt;
 use std::cell::Cell;
@@ -57,6 +60,9 @@ pub struct HTMLScriptElement {
     /// https://html.spec.whatwg.org/multipage/#ready-to-be-parser-executed
     ready_to_be_parser_executed: Cell<bool>,
 
+    /// https://html.spec.whatwg.org/multipage/#concept-script-type
+    type_: Cell<ScriptType>,
+
     /// Document of the parser that created this element
     parser_document: JS<Document>,
 
@@ -74,6 +80,7 @@ impl HTMLScriptElement {
             parser_inserted: Cell::new(creator == ElementCreator::ParserCreated),
             non_blocking: Cell::new(creator != ElementCreator::ParserCreated),
             ready_to_be_parser_executed: Cell::new(false),
+            type_: Cell::new(ScriptType::Unset),
             parser_document: JS::from_ref(document),
             load: DOMRefCell::new(None),
         }
@@ -109,6 +116,13 @@ static SCRIPT_JS_MIMES: StaticStringVec = &[
     "text/x-ecmascript",
     "text/x-javascript",
 ];
+
+#[derive(Clone, Copy, HeapSizeOf, JSTraceable, PartialEq)]
+pub enum ScriptType {
+    Classic,
+    Module,
+    Unset
+}
 
 #[derive(HeapSizeOf, JSTraceable)]
 pub struct ScriptOrigin {
@@ -152,8 +166,12 @@ struct ScriptContext {
     status: Result<(), NetworkError>
 }
 
-impl AsyncResponseListener for ScriptContext {
-    fn headers_available(&mut self, metadata: Result<Metadata, NetworkError>) {
+impl FetchResponseListener for ScriptContext {
+    fn process_request_body(&mut self) {} // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+
+    fn process_request_eof(&mut self) {} // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+
+    fn process_response(&mut self, metadata: Result<Metadata, NetworkError>) {
         self.metadata = metadata.ok();
 
         let status_code = self.metadata.as_ref().and_then(|m| {
@@ -170,18 +188,17 @@ impl AsyncResponseListener for ScriptContext {
         };
     }
 
-    fn data_available(&mut self, payload: Vec<u8>) {
+    fn process_response_chunk(&mut self, mut chunk: Vec<u8>) {
         if self.status.is_ok() {
-            let mut payload = payload;
-            self.data.append(&mut payload);
+            self.data.append(&mut chunk);
         }
     }
 
     /// https://html.spec.whatwg.org/multipage/#fetch-a-classic-script
     /// step 4-9
-    fn response_complete(&mut self, status: Result<(), NetworkError>) {
+    fn process_response_eof(&mut self, response: Result<(), NetworkError>) {
         // Step 5.
-        let load = status.and(self.status.clone()).map(|_| {
+        let load = response.and(self.status.clone()).map(|_| {
             let metadata = self.metadata.take().unwrap();
 
             // Step 6.
@@ -211,33 +228,53 @@ impl PreInvoke for ScriptContext {}
 /// https://html.spec.whatwg.org/multipage/#fetch-a-classic-script
 fn fetch_a_classic_script(script: &HTMLScriptElement,
                           url: Url,
+                          cors_setting: Option<CORSSettings>,
+                          cryptographic_nonce: DOMString,
+                          parser_state: ParserMetadata,
                           character_encoding: EncodingRef) {
-    // TODO(#9186): use the fetch infrastructure.
+    let doc = document_from_node(script);
+
+    // Step 1, 2.
+    let request = PotentialCORSRequestInit {
+        method: Method::Get,
+        url: url.clone(),
+        headers: Headers::new(),
+        body: None,
+        type_: RequestType::Script,
+        destination: Destination::Script,
+        synchronous: false,
+        use_cors_preflight: false,
+        use_url_credentials: true,
+        cryptographic_metadata: String::from(cryptographic_nonce),
+        parser_metadata: parser_state,
+        origin: doc.url().clone(),
+        referer_url: None,
+        referrer_policy: None,
+        cors_attribute_state: cors_setting,
+        same_origin_fallback: false,
+    };
+
+    // TODO: Step 3, Add custom steps to perform fetch
+
     let context = Arc::new(Mutex::new(ScriptContext {
         elem: Trusted::new(script),
         character_encoding: character_encoding,
-        data: vec!(),
+        data: vec![],
         metadata: None,
         url: url.clone(),
-        status: Ok(())
+        status: Ok(()),
     }));
-
-    let doc = document_from_node(script);
-
     let (action_sender, action_receiver) = ipc::channel().unwrap();
     let listener = NetworkListener {
         context: context,
         script_chan: doc.window().networking_task_source(),
         wrapper: Some(doc.window().get_runnable_wrapper()),
     };
-    let response_target = AsyncResponseTarget {
-        sender: action_sender,
-    };
-    ROUTER.add_route(action_receiver.to_opaque(), box move |message| {
-        listener.notify_action(message.to().unwrap());
-    });
 
-    doc.load_async(LoadType::Script(url), response_target);
+    ROUTER.add_route(action_receiver.to_opaque(), box move |message| {
+        listener.notify_fetch(message.to().unwrap());
+    });
+    doc.fetch_async(LoadType::Script(url), request, action_sender);
 }
 
 impl HTMLScriptElement {
@@ -272,8 +309,37 @@ impl HTMLScriptElement {
         }
 
         // Step 6.
-        if !self.is_javascript() {
-            return NextParserState::Continue;
+        let type_attribute = element.get_attribute(&ns!(), &atom!("type"));
+        let language_attribute = element.get_attribute(&ns!(), &atom!("language"));
+        match (type_attribute.r(), language_attribute.r()) {
+            (Some(type_attribute), _) => {
+                let type_value = type_attribute.value().to_ascii_lowercase();
+                let type_value = type_value.trim_matches(HTML_SPACE_CHARACTERS);
+
+                if type_value.is_empty() || SCRIPT_JS_MIMES.contains(&type_value) {
+                    self.type_.set(ScriptType::Classic);
+                } else if type_value == "module" {
+                    self.type_.set(ScriptType::Module);
+                } else {
+                    return NextParserState::Continue;
+                }
+            }
+            (None, Some(language_attribute)) => {
+                let language_value = language_attribute.value().to_ascii_lowercase();
+
+                if language_value.is_empty() {
+                    self.type_.set(ScriptType::Classic);
+                } else {
+                    let type_string = format!("text/{}", language_value);
+
+                    if SCRIPT_JS_MIMES.contains(&&*type_string) {
+                        self.type_.set(ScriptType::Classic);
+                    } else {
+                        return NextParserState::Continue;
+                    }
+                }
+            }
+            _ => self.type_.set(ScriptType::Classic)
         }
 
         // Step 7.
@@ -301,8 +367,8 @@ impl HTMLScriptElement {
         // Step 12.
         let for_attribute = element.get_attribute(&ns!(), &atom!("for"));
         let event_attribute = element.get_attribute(&ns!(), &atom!("event"));
-        match (for_attribute.r(), event_attribute.r()) {
-            (Some(for_attribute), Some(event_attribute)) => {
+        match (for_attribute.r(), event_attribute.r(), self.type_.get()) {
+            (Some(for_attribute), Some(event_attribute), ScriptType::Classic) => {
                 let for_value = for_attribute.value().to_ascii_lowercase();
                 let for_value = for_value.trim_matches(HTML_SPACE_CHARACTERS);
                 if for_value != "window" {
@@ -315,7 +381,7 @@ impl HTMLScriptElement {
                     return NextParserState::Continue;
                 }
             },
-            (_, _) => (),
+            (_, _, _) => (),
         }
 
         // Step 13.
@@ -323,11 +389,23 @@ impl HTMLScriptElement {
                               .and_then(|charset| encoding_from_whatwg_label(&charset.value()))
                               .unwrap_or_else(|| doc.encoding());
 
-        // TODO: Step 14: CORS.
+        // Step 14.
+        let cors_setting = match &*self.CrossOrigin() {
+            "anonymous" => Some(CORSSettings::Anonymous),
+            "use-credentials" => Some(CORSSettings::UseCredentials),
+            "" => None,
+            _ => Some(CORSSettings::Anonymous)
+        };
 
-        // TODO: Step 15: Nonce.
+        // Step 15.
+        let cryptographic_nonce = element.get_string_attribute(&atom!("nonce"));
 
-        // TODO: Step 16: Parser state.
+        // Step 16.
+        let parser_state = if self.parser_inserted.get() {
+            ParserMetadata::ParserInserted
+        } else {
+            ParserMetadata::NotParserInserted
+        };
 
         // TODO: Step 17: environment settings object.
 
@@ -355,9 +433,21 @@ impl HTMLScriptElement {
                 };
 
                 // Step 18.6.
-                fetch_a_classic_script(self, url, encoding);
-                true
+                match self.type_.get() {
+                    ScriptType::Classic => {
+                        fetch_a_classic_script(self, url, cors_setting,
+                                               cryptographic_nonce, parser_state, encoding);
+                        true
+                    }
+                    ScriptType::Module => {
+                        // TODO: Support module scripts
+                        warn!("Module script is unsupported for script {}", &**src);
+                        return NextParserState::Continue;
+                    }
+                    ScriptType::Unset => unreachable!()
+                }
             },
+            // TODO: Step 19.
             None => false,
         };
 
@@ -515,46 +605,6 @@ impl HTMLScriptElement {
                             EventCancelable::NotCancelable);
     }
 
-    pub fn is_javascript(&self) -> bool {
-        let element = self.upcast::<Element>();
-        let type_attr = element.get_attribute(&ns!(), &atom!("type"));
-        let is_js = match type_attr.as_ref().map(|s| s.value()) {
-            Some(ref s) if s.is_empty() => {
-                // type attr exists, but empty means js
-                debug!("script type empty, inferring js");
-                true
-            },
-            Some(s) => {
-                debug!("script type={}", &**s);
-                SCRIPT_JS_MIMES.contains(&s.to_ascii_lowercase().trim_matches(HTML_SPACE_CHARACTERS))
-            },
-            None => {
-                debug!("no script type");
-                let language_attr = element.get_attribute(&ns!(), &atom!("language"));
-                let is_js = match language_attr.as_ref().map(|s| s.value()) {
-                    Some(ref s) if s.is_empty() => {
-                        debug!("script language empty, inferring js");
-                        true
-                    },
-                    Some(s) => {
-                        debug!("script language={}", &**s);
-                        let mut language = format!("text/{}", &**s);
-                        language.make_ascii_lowercase();
-                        SCRIPT_JS_MIMES.contains(&&*language)
-                    },
-                    None => {
-                        debug!("no script type or language, inferring js");
-                        true
-                    }
-                };
-                // https://github.com/rust-lang/rust/issues/21114
-                is_js
-            }
-        };
-        // https://github.com/rust-lang/rust/issues/21114
-        is_js
-    }
-
     pub fn set_already_started(&self, already_started: bool) {
         self.already_started.set(already_started);
     }
@@ -651,6 +701,12 @@ impl HTMLScriptElementMethods for HTMLScriptElement {
     make_getter!(HtmlFor, "for");
     // https://html.spec.whatwg.org/multipage/#dom-script-htmlfor
     make_setter!(SetHtmlFor, "for");
+
+    // https://html.spec.whatwg.org/multipage/#attr-script-crossorigin
+    make_enumerated_getter!(CrossOrigin, "crossorigin", "anonymous",
+                            ("use-credentials") | (""));
+    // https://html.spec.whatwg.org/multipage/#attr-script-crossorigin
+    make_setter!(SetCrossOrigin, "crossorigin");
 
     // https://html.spec.whatwg.org/multipage/#dom-script-text
     fn Text(&self) -> DOMString {
